@@ -79,7 +79,7 @@ where
             .into_iter()
             .for_each(|mut srv| srv.register(&mut config));
 
-        let mut rmap = ResourceMap::new(ResourceDef::new(""));
+        let mut rmap = ResourceMap::new(ResourceDef::root_prefix(""));
 
         let (config, services) = config.into_services();
 

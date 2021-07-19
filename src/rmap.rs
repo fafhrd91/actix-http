@@ -10,37 +10,65 @@ use crate::request::HttpRequest;
 
 #[derive(Clone, Debug)]
 pub struct ResourceMap {
-    root: ResourceDef,
+    pattern: ResourceDef,
+
+    /// Named resources within the tree or, for external resources,
+    /// it points to isolated nodes outside the tree.
+    named: AHashMap<String, Rc<ResourceMap>>,
+
     parent: RefCell<Weak<ResourceMap>>,
-    named: AHashMap<String, ResourceDef>,
-    patterns: Vec<(ResourceDef, Option<Rc<ResourceMap>>)>,
+
+    /// Must be `None` for "terminating" patterns
+    nodes: Option<Vec<Rc<ResourceMap>>>,
 }
 
 impl ResourceMap {
+    /// Creates a _container_ node in the `ResourceMap` tree.
     pub fn new(root: ResourceDef) -> Self {
         ResourceMap {
-            root,
-            parent: RefCell::new(Weak::new()),
+            pattern: root,
             named: AHashMap::default(),
-            patterns: Vec::new(),
+            parent: RefCell::new(Weak::new()),
+            nodes: Some(Vec::new()),
         }
     }
 
+    /// Adds a (possibly nested) resource.
+    ///
+    /// To add a terminating pattern, `nested` must be `None`.
+    /// To add external resource, supply a pattern without a leading `/`.
+    /// The root pattern of `nested`, if present, should match `pattern`.
     pub fn add(&mut self, pattern: &mut ResourceDef, nested: Option<Rc<ResourceMap>>) {
-        pattern.set_id(self.patterns.len() as u16);
-        self.patterns.push((pattern.clone(), nested));
-        if !pattern.name().is_empty() {
-            self.named
-                .insert(pattern.name().to_string(), pattern.clone());
+        pattern.set_id(self.nodes.as_ref().unwrap().len() as u16);
+
+        if let Some(new_node) = nested {
+            assert_eq!(new_node.pattern.pattern(), pattern.pattern());
+            self.named.extend(new_node.named.clone().into_iter());
+            self.nodes.as_mut().unwrap().push(new_node);
+        } else {
+            let new_node = Rc::new(ResourceMap {
+                pattern: pattern.clone(),
+                named: AHashMap::default(),
+                parent: RefCell::new(Weak::new()),
+                nodes: None,
+            });
+
+            if !pattern.name().is_empty() {
+                self.named
+                    .insert(pattern.name().to_owned(), Rc::clone(&new_node));
+            }
+
+            // Don't add external resources to the tree
+            if pattern.pattern().is_empty() || pattern.pattern().starts_with('/') {
+                self.nodes.as_mut().unwrap().push(new_node);
+            }
         }
     }
 
-    pub(crate) fn finish(&self, current: Rc<ResourceMap>) {
-        for (_, nested) in &self.patterns {
-            if let Some(ref nested) = nested {
-                *nested.parent.borrow_mut() = Rc::downgrade(&current);
-                nested.finish(nested.clone());
-            }
+    pub(crate) fn finish(&self, this: Rc<ResourceMap>) {
+        for node in this.nodes.iter().flatten() {
+            *node.parent.borrow_mut() = Rc::downgrade(&this);
+            node.finish(Rc::clone(node));
         }
     }
 
@@ -58,192 +86,103 @@ impl ResourceMap {
         U: IntoIterator<Item = I>,
         I: AsRef<str>,
     {
-        let mut path = String::new();
         let mut elements = elements.into_iter();
 
-        if self.patterns_for(name, &mut path, &mut elements)?.is_some() {
-            if path.starts_with('/') {
-                let conn = req.connection_info();
-                Ok(Url::parse(&format!(
-                    "{}://{}{}",
-                    conn.scheme(),
-                    conn.host(),
-                    path
-                ))?)
-            } else {
-                Ok(Url::parse(&path)?)
-            }
+        let path = self
+            .named
+            .get(name)
+            .ok_or(UrlGenerationError::ResourceNotFound)?
+            .fold_parents(String::new(), |mut acc, node| {
+                if node.pattern.resource_path(&mut acc, &mut elements) {
+                    Some(acc)
+                } else {
+                    None
+                }
+            })
+            .ok_or(UrlGenerationError::NotEnoughElements)?;
+
+        if path.starts_with('/') {
+            let conn = req.connection_info();
+            Ok(Url::parse(&format!(
+                "{}://{}{}",
+                conn.scheme(),
+                conn.host(),
+                path
+            ))?)
         } else {
-            Err(UrlGenerationError::ResourceNotFound)
+            Ok(Url::parse(&path)?)
         }
     }
 
     pub fn has_resource(&self, path: &str) -> bool {
-        let path = if path.is_empty() { "/" } else { path };
-
-        for (pattern, rmap) in &self.patterns {
-            if let Some(ref rmap) = rmap {
-                if let Some(plen) = pattern.is_prefix_match(path) {
-                    return rmap.has_resource(&path[plen..]);
-                }
-            } else if pattern.is_match(path) || pattern.pattern() == "" && path == "/" {
-                return true;
-            }
-        }
-        false
+        self.find_matching_node(path).is_some()
     }
 
     /// Returns the name of the route that matches the given path or None if no full match
-    /// is possible.
+    /// is possible or the matching resource is not named.
     pub fn match_name(&self, path: &str) -> Option<&str> {
-        let path = if path.is_empty() { "/" } else { path };
-
-        for (pattern, rmap) in &self.patterns {
-            if let Some(ref rmap) = rmap {
-                if let Some(plen) = pattern.is_prefix_match(path) {
-                    return rmap.match_name(&path[plen..]);
-                }
-            } else if pattern.is_match(path) {
-                return match pattern.name() {
-                    "" => None,
-                    s => Some(s),
-                };
-            }
-        }
-
-        None
+        self.find_matching_node(path)
+            .and_then(|node| match node.pattern.name() {
+                "" => None,
+                s => Some(s),
+            })
     }
 
     /// Returns the full resource pattern matched against a path or None if no full match
     /// is possible.
     pub fn match_pattern(&self, path: &str) -> Option<String> {
-        let path = if path.is_empty() { "/" } else { path };
-
-        // ensure a full match exists
-        if !self.has_resource(path) {
-            return None;
-        }
-
-        Some(self.traverse_resource_pattern(path))
+        self.find_matching_node(path)?
+            .fold_parents(String::new(), |mut acc, node| {
+                acc.push_str(node.pattern.pattern());
+                Some(acc)
+            })
     }
 
-    /// Takes remaining path and tries to match it up against a resource definition within the
-    /// current resource map recursively, returning a concatenation of all resource prefixes and
-    /// patterns matched in the tree.
-    ///
-    /// Should only be used after checking the resource exists in the map so that partial match
-    /// patterns are not returned.
-    fn traverse_resource_pattern(&self, remaining: &str) -> String {
-        for (pattern, rmap) in &self.patterns {
-            if let Some(ref rmap) = rmap {
-                if let Some(prefix_len) = pattern.is_prefix_match(remaining) {
-                    let prefix = pattern.pattern().to_owned();
-
-                    return [
-                        prefix,
-                        rmap.traverse_resource_pattern(&remaining[prefix_len..]),
-                    ]
-                    .concat();
-                }
-            } else if pattern.is_match(remaining) {
-                return pattern.pattern().to_owned();
-            }
-        }
-
-        String::new()
+    fn find_matching_node(&self, path: &str) -> Option<&ResourceMap> {
+        self._find_matching_node(path).flatten()
     }
 
-    fn patterns_for<U, I>(
-        &self,
-        name: &str,
-        path: &mut String,
-        elements: &mut U,
-    ) -> Result<Option<()>, UrlGenerationError>
-    where
-        U: Iterator<Item = I>,
-        I: AsRef<str>,
-    {
-        if self.pattern_for(name, path, elements)?.is_some() {
-            Ok(Some(()))
+    /// Returns `None` if root pattern doesn't match;
+    /// `Some(None)` if root pattern matches but there is no matching child pattern.
+    /// Don't search sideways when `Some(none)` is returned.
+    fn _find_matching_node(&self, path: &str) -> Option<Option<&ResourceMap>> {
+        let matched_len = if path.is_empty() && self.pattern.pattern().is_empty() {
+            // ResourceDef::is_prefix_match has a bug where empty pattern doesn't match empty path
+            0
         } else {
-            self.parent_pattern_for(name, path, elements)
-        }
+            self.pattern.is_prefix_match(path)?
+        };
+        let path = &path[matched_len..];
+
+        Some(match &self.nodes {
+            Some(nodes) => nodes
+                .iter()
+                .filter_map(|node| node._find_matching_node(path))
+                .next()
+                .flatten(),
+
+            None => Some(self),
+        })
     }
 
-    fn pattern_for<U, I>(
-        &self,
-        name: &str,
-        path: &mut String,
-        elements: &mut U,
-    ) -> Result<Option<()>, UrlGenerationError>
+    /// Folds the parents from the root of the tree to self.
+    fn fold_parents<F, B>(&self, init: B, mut f: F) -> Option<B>
     where
-        U: Iterator<Item = I>,
-        I: AsRef<str>,
+        F: FnMut(B, &ResourceMap) -> Option<B>,
     {
-        if let Some(pattern) = self.named.get(name) {
-            if pattern.pattern().starts_with('/') {
-                self.fill_root(path, elements)?;
-            }
-            if pattern.resource_path(path, elements) {
-                Ok(Some(()))
-            } else {
-                Err(UrlGenerationError::NotEnoughElements)
-            }
-        } else {
-            for (_, rmap) in &self.patterns {
-                if let Some(ref rmap) = rmap {
-                    if rmap.pattern_for(name, path, elements)?.is_some() {
-                        return Ok(Some(()));
-                    }
-                }
-            }
-            Ok(None)
-        }
+        self._fold_parents(init, &mut f)
     }
 
-    fn fill_root<U, I>(
-        &self,
-        path: &mut String,
-        elements: &mut U,
-    ) -> Result<(), UrlGenerationError>
+    fn _fold_parents<F, B>(&self, init: B, f: &mut F) -> Option<B>
     where
-        U: Iterator<Item = I>,
-        I: AsRef<str>,
+        F: FnMut(B, &ResourceMap) -> Option<B>,
     {
-        if let Some(ref parent) = self.parent.borrow().upgrade() {
-            parent.fill_root(path, elements)?;
-        }
-        if self.root.resource_path(path, elements) {
-            Ok(())
-        } else {
-            Err(UrlGenerationError::NotEnoughElements)
-        }
-    }
+        let data = match self.parent.borrow().upgrade() {
+            Some(ref parent) => parent._fold_parents(init, f)?,
+            None => init,
+        };
 
-    fn parent_pattern_for<U, I>(
-        &self,
-        name: &str,
-        path: &mut String,
-        elements: &mut U,
-    ) -> Result<Option<()>, UrlGenerationError>
-    where
-        U: Iterator<Item = I>,
-        I: AsRef<str>,
-    {
-        if let Some(ref parent) = self.parent.borrow().upgrade() {
-            if let Some(pattern) = parent.named.get(name) {
-                self.fill_root(path, elements)?;
-                if pattern.resource_path(path, elements) {
-                    Ok(Some(()))
-                } else {
-                    Err(UrlGenerationError::NotEnoughElements)
-                }
-            } else {
-                parent.parent_pattern_for(name, path, elements)
-            }
-        } else {
-            Ok(None)
-        }
+        f(data, self)
     }
 }
 
@@ -255,7 +194,7 @@ mod tests {
     fn extract_matched_pattern() {
         let mut root = ResourceMap::new(ResourceDef::root_prefix(""));
 
-        let mut user_map = ResourceMap::new(ResourceDef::root_prefix(""));
+        let mut user_map = ResourceMap::new(ResourceDef::root_prefix("/user/{id}"));
         user_map.add(&mut ResourceDef::new("/"), None);
         user_map.add(&mut ResourceDef::new("/profile"), None);
         user_map.add(&mut ResourceDef::new("/article/{id}"), None);
@@ -271,6 +210,7 @@ mod tests {
             &mut ResourceDef::root_prefix("/user/{id}"),
             Some(Rc::new(user_map)),
         );
+        root.add(&mut ResourceDef::new("/info"), None);
 
         let root = Rc::new(root);
         root.finish(Rc::clone(&root));
@@ -332,7 +272,7 @@ mod tests {
         *rdef.name_mut() = "root_info".to_owned();
         root.add(&mut rdef, None);
 
-        let mut user_map = ResourceMap::new(ResourceDef::root_prefix(""));
+        let mut user_map = ResourceMap::new(ResourceDef::root_prefix("/user/{id}"));
         let mut rdef = ResourceDef::new("/");
         user_map.add(&mut rdef, None);
 
@@ -373,7 +313,7 @@ mod tests {
         // ref: https://github.com/actix/actix-web/issues/1582
         let mut root = ResourceMap::new(ResourceDef::root_prefix(""));
 
-        let mut user_map = ResourceMap::new(ResourceDef::root_prefix(""));
+        let mut user_map = ResourceMap::new(ResourceDef::root_prefix("/user/{id}"));
         user_map.add(&mut ResourceDef::new("/"), None);
         user_map.add(&mut ResourceDef::new("/profile"), None);
         user_map.add(&mut ResourceDef::new("/article/{id}"), None);
@@ -394,15 +334,45 @@ mod tests {
         // check root has no parent
         assert!(root.parent.borrow().upgrade().is_none());
         // check child has parent reference
-        assert!(root.patterns[0].1.is_some());
+        assert!(root.nodes.as_ref().unwrap()[0]
+            .parent
+            .borrow()
+            .upgrade()
+            .is_some());
         // check child's parent root id matches root's root id
-        assert_eq!(
-            root.patterns[0].1.as_ref().unwrap().root.id(),
-            root.root.id()
-        );
+        assert!(Rc::ptr_eq(
+            &root.nodes.as_ref().unwrap()[0]
+                .parent
+                .borrow()
+                .upgrade()
+                .unwrap(),
+            &root
+        ));
 
         let output = format!("{:?}", root);
         assert!(output.starts_with("ResourceMap {"));
         assert!(output.ends_with(" }"));
+    }
+
+    #[test]
+    fn short_circuit() {
+        let mut root = ResourceMap::new(ResourceDef::root_prefix(""));
+
+        let mut user_root = ResourceDef::root_prefix("/user");
+        let mut user_map = ResourceMap::new(user_root.clone());
+        user_map.add(&mut ResourceDef::new("/u1"), None);
+        user_map.add(&mut ResourceDef::new("/u2"), None);
+
+        root.add(&mut ResourceDef::new("/user/u3"), None);
+        root.add(&mut user_root, Some(Rc::new(user_map)));
+        root.add(&mut ResourceDef::new("/user/u4"), None);
+
+        let rmap = Rc::new(root);
+        rmap.finish(Rc::clone(&rmap));
+
+        assert!(rmap.has_resource("/user/u1"));
+        assert!(rmap.has_resource("/user/u2"));
+        assert!(rmap.has_resource("/user/u3"));
+        assert!(!rmap.has_resource("/user/u4"));
     }
 }
